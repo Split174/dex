@@ -30,6 +30,7 @@ type oauthConnector struct {
 	emailKey             string
 	emailVerifiedKey     string
 	groupsKey            string
+	allowedDomains       []string // Новое поле для хранения доменов
 	httpClient           *http.Client
 	logger               *slog.Logger
 }
@@ -49,7 +50,10 @@ type Config struct {
 	RootCAs            []string `json:"rootCAs"`
 	InsecureSkipVerify bool     `json:"insecureSkipVerify"`
 	UserIDKey          string   `json:"userIDKey"` // defaults to "id"
-	ClaimMapping       struct {
+
+	AllowedDomains []string `json:"allowedDomains"` // Новое поле для фильтрации по домену
+
+	ClaimMapping struct {
 		UserNameKey          string `json:"userNameKey"`          // defaults to "user_name"
 		PreferredUsernameKey string `json:"preferredUsernameKey"` // defaults to "preferred_username"
 		GroupsKey            string `json:"groupsKey"`            // defaults to "groups"
@@ -106,6 +110,7 @@ func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, erro
 		groupsKey:            groupsKey,
 		emailKey:             emailKey,
 		emailVerifiedKey:     emailVerifiedKey,
+		allowedDomains:       c.AllowedDomains,
 	}
 
 	oauthConn.httpClient, err = httpclient.NewHTTPClient(c.RootCAs, c.InsecureSkipVerify)
@@ -187,6 +192,33 @@ func (c *oauthConnector) HandleCallback(s connector.Scopes, r *http.Request) (id
 	identity.PreferredUsername, _ = userInfoResult[c.preferredUsernameKey].(string)
 	identity.Email, _ = userInfoResult[c.emailKey].(string)
 	identity.EmailVerified, _ = userInfoResult[c.emailVerifiedKey].(bool)
+
+	if len(c.allowedDomains) > 0 {
+		if identity.Email == "" {
+			c.logger.Warn("user rejected: no email in user info, but domain filtering is enabled", "user_id", identity.UserID)
+			return identity, errors.New("access denied: your account has no email address, which is required")
+		}
+
+		parts := strings.Split(identity.Email, "@")
+		if len(parts) != 2 {
+			c.logger.Warn("user rejected: invalid email format", "email", identity.Email)
+			return identity, fmt.Errorf("access denied: invalid email format '%s'", identity.Email)
+		}
+		userDomain := strings.ToLower(parts[1])
+
+		domainAllowed := false
+		for _, allowedDomain := range c.allowedDomains {
+			if strings.EqualFold(userDomain, allowedDomain) {
+				domainAllowed = true
+				break
+			}
+		}
+
+		if !domainAllowed {
+			c.logger.Warn("user rejected: email domain not in allowed list", "email", identity.Email, "domain", userDomain)
+			return identity, fmt.Errorf("access denied: email domain '%s' is not allowed", userDomain)
+		}
+	}
 
 	if s.Groups {
 		groups := map[string]struct{}{}
